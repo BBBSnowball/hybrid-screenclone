@@ -214,15 +214,16 @@ bool xinerama_screen::intersect_rectangle( const XRectangle &rec ) const {
 
 struct image_replayer {
 	const display *src, *dst;
-	const xinerama_screen *src_screen;
+	const xinerama_screen *src_screen, *dst_screen;
 	window src_window, dst_window;
 	XShmSegmentInfo src_info, dst_info;
 	XImage *src_image, *dst_image;
 	GC dst_gc;
 	bool damaged;
 
-	image_replayer( const display &_src, const display &_dst, const xinerama_screen &_src_screen )
-		: src( &_src ), dst( &_dst), src_screen( &_src_screen )
+	image_replayer( const display &_src, const display &_dst, const xinerama_screen &_src_screen, const xinerama_screen &_dst_screen )
+		: src( &_src ), dst( &_dst)
+		, src_screen( &_src_screen ), dst_screen( &_dst_screen )
 		, src_window( src->root() ), dst_window( dst->root() )
 		, damaged( true )
 	{	
@@ -251,7 +252,8 @@ struct image_replayer {
 
 		TC( XShmGetImage( src->dpy, src_window.win, src_image,
 				src_screen->info.x_org, src_screen->info.y_org, AllPlanes) );
-		TC( XShmPutImage( dst->dpy, dst_window.win, dst_gc, dst_image, 0, 0, 0, 0,
+		TC( XShmPutImage( dst->dpy, dst_window.win, dst_gc, dst_image, 0, 0,
+				dst_screen->info.x_org, dst_screen->info.y_org,
 				dst_image->width, dst_image->height, False ) );
 		TC( XFlush( dst->dpy ) );
 
@@ -267,15 +269,16 @@ struct image_replayer {
 
 struct mouse_replayer {
 	const display src, dst;
-	const xinerama_screen src_screen;
+	const xinerama_screen src_screen, dst_screen;
 	window dst_window;
 	Cursor invisibleCursor;
 	volatile bool on;
+	bool wiggle;
 	std::recursive_mutex cursor_mutex;
 
-	mouse_replayer( const display &_src, const display &_dst, const xinerama_screen &_src_screen )
-		: src( _src ), dst( _dst), src_screen( _src_screen ), dst_window( dst.root() )
-		, on( false )
+	mouse_replayer( const display &_src, const display &_dst, const xinerama_screen &_src_screen, const xinerama_screen &_dst_screen, bool _wiggle )
+		: src( _src ), dst( _dst), src_screen( _src_screen ), dst_screen( _dst_screen ), dst_window( dst.root() )
+		, on( false ), wiggle( _wiggle )
 	{
 		// create invisible cursor
 		Pixmap bitmapNoData;
@@ -309,8 +312,9 @@ struct mouse_replayer {
 		on = src_screen.in_screen( x, y );
 
 		if ( on )
-			dst_window.warp_pointer( x - src_screen.info.x_org, y - src_screen.info.y_org );
-		else
+			dst_window.warp_pointer( x - src_screen.info.x_org + dst_screen.info.x_org,
+				y - src_screen.info.y_org + dst_screen.info.y_org );
+		else if ( wiggle )
 			// wiggle the cursor a bit to keep screensaver away
 			dst_window.warp_pointer( x % 50, y % 50 );
 
@@ -371,9 +375,11 @@ void usage( const char *name )
 	std::cerr
 		<< "Usage: " << name << " <options>" << std::endl
 		<< "Options:" << std::endl
-		<< " -s <display name> (default :0)" << std::endl
-		<< " -d <display name> (default :1)" << std::endl
-		<< " -x <xinerama screen number> (default 0)" << std::endl;
+		<< " -s <source display name> (default :0)" << std::endl
+		<< " -d <target display name> (default :1)" << std::endl
+		<< " -x <xinerama screen number on source> (default 0)" << std::endl
+		<< " -D <xinerama screen number on target> (default 0)" << std::endl
+		<< " -w do not wiggle the mouse (screensaver might come on, but necessary for multi-clones)" << std::endl;
 	exit( 0 );
 }
 
@@ -382,10 +388,12 @@ int main( int argc, char *argv[] )
 	XInitThreads();
 
 	std::string src_name( ":0" ), dst_name( ":1" );
-	unsigned screen_number = 0;
+	unsigned src_screen_number = 0;
+	unsigned dst_screen_number = 0;
+	bool wiggle = true;
 
 	int opt;
-	while ( ( opt = getopt( argc, argv, "s:d:x:h" ) ) != -1 )
+	while ( ( opt = getopt( argc, argv, "s:d:x:D:hw" ) ) != -1 )
 		switch ( opt ) {
 		case 's':
 			src_name = optarg;
@@ -394,7 +402,13 @@ int main( int argc, char *argv[] )
 			dst_name = optarg;
 			break;
 		case 'x':
-			screen_number = atoi( optarg );
+			src_screen_number = atoi( optarg );
+			break;
+		case 'D':
+			dst_screen_number = atoi( optarg );
+			break;
+		case 'w':
+			wiggle = false;
 			break;
 		default:
 			usage( argv[ 0 ] );
@@ -404,14 +418,18 @@ int main( int argc, char *argv[] )
 		ERR;
 	display src( src_name ), dst( dst_name );
 
-	auto screens = src.xinerama_screens();
-	if ( screen_number < 0 || screen_number >= screens.size() )
+	auto src_screens = src.xinerama_screens();
+	if ( src_screen_number < 0 || src_screen_number >= src_screens.size() )
 		ERR;
-	auto &screen = screens[ screen_number ];
+	auto dst_screens = dst.xinerama_screens();
+	if ( dst_screen_number < 0 || dst_screen_number >= dst_screens.size() )
+		ERR;
+	auto &src_screen = src_screens[ src_screen_number ];
+	auto &dst_screen = dst_screens[ dst_screen_number ];
 
 	// Clone src not to fight with the blocking loop.
-	mouse_replayer mouse( src.clone(), dst, screen );
-	image_replayer image( src, dst, screen );
+	mouse_replayer mouse( src.clone(), dst, src_screen, dst_screen, wiggle );
+	image_replayer image( src, dst, src_screen, dst_screen );
 
 	window root = src.root();
 	root.create_damage();
