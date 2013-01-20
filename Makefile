@@ -1,4 +1,4 @@
 CXXFLAGS=-std=c++0x -g -Wall
-LDLIBS=-lpthread -lX11 -lXdamage -lXtst -lXinerama -lXcursor -lXfixes -lXext
+LDLIBS=-lpthread -lX11 -lXdamage -lXtst -lXinerama -lXcursor -lXfixes -lXext -lXrandr
 
 screenclone:

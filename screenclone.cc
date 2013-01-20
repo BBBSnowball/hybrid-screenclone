@@ -23,10 +23,12 @@
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xinerama.h>
 #include <X11/extensions/record.h>
+#include <X11/extensions/Xrandr.h>
 
 #define STR2(x) #x
 #define STR(x) STR2( x )
 #define ERR throw std::runtime_error( std::string() + __FILE__ + ":" + STR( __LINE__ ) + " " + __FUNCTION__ )
+#define ERR2(msg) throw std::runtime_error( std::string() + __FILE__ + ":" + STR( __LINE__ ) + " " + __FUNCTION__  + ": " + msg)
 
 #if 1 // debugging off
 # define DBG(x)
@@ -383,13 +385,102 @@ void usage( const char *name )
 	exit( 0 );
 }
 
+xinerama_screen& get_xinerama_screen(display& disp, display::screens_vector& screens, char* name)
+{
+	//auto screens = disp.xinerama_screens();
+
+	if ( !name )
+		return screens[0];
+
+	else if ( name[0] >= '0' && name[0] <= '9' ) {
+		unsigned number = atoi( name );
+
+		if ( number < 0 || number >= screens.size() )
+			ERR;
+
+		return screens[number];
+	}
+
+	// It seems to be a name
+	// -> look at Xrandr info and find the name
+
+    int screen = DefaultScreen (disp.dpy);
+	Window root = RootWindow (disp.dpy, screen);
+	XRRScreenResources* res =  XRRGetScreenResources(disp.dpy, root);
+	xinerama_screen* result = NULL;
+    for (int o = 0; o < res->noutput; o++)
+    {
+		XRROutputInfo	*output_info = XRRGetOutputInfo (disp.dpy, res, res->outputs[o]);
+
+		/*const char* connection;
+		switch (output_info->connection) {
+			case RR_Connected:
+				connection = "connected";
+				break;
+			case RR_Disconnected:
+				connection = "disconnected";
+				break;
+			case RR_UnknownConnection:
+			default:
+				connection = "unknown";
+				break;
+		}
+		printf("name: %s - %s\n", output_info->name, connection);*/
+
+		if ( strcmp(output_info->name, name) != 0 )
+			continue;
+
+		//NOTE There is also a list of crtcs...
+		/*for (int j=0;j<res->ncrtc;j++) {
+			XRRGetCrtcInfo(disp.dpy, res, res->crtcs[j]);
+		}*/
+
+		if (output_info->crtc != 0) {
+			XRRCrtcInfo* crtc_info = XRRGetCrtcInfo(disp.dpy, res, output_info->crtc);
+
+			printf("  x = %d, y = %d, width = %d, height = %d\n",
+				crtc_info->x, crtc_info->y, crtc_info->width, crtc_info->height);
+
+			// find a matching Xinerama screen
+			for (unsigned i = 0;i<screens.size();i++) {
+				auto& screen = screens[i];
+				if (             screen.info.x_org  == crtc_info->x
+					&&           screen.info.y_org  == crtc_info->y
+					&& (unsigned)screen.info.width  == crtc_info->width
+					&& (unsigned)screen.info.height == crtc_info->height ) {
+						result = &screen;
+						break;
+				}
+			}
+
+			if (!result)
+				ERR2("couldn't find matching Xinerama screen");
+
+			XRRFreeCrtcInfo(crtc_info);
+		} else {
+			ERR2("no CRTC for that screen");
+		}
+
+		XRRFreeOutputInfo(output_info);
+
+		break;
+	}
+
+	XRRFreeScreenResources(res);
+
+	if (!result)
+		ERR2("no screen with that name");
+
+	return *result;
+}
+
 int main( int argc, char *argv[] )
 {
 	XInitThreads();
 
 	std::string src_name( ":0" ), dst_name( ":1" );
-	unsigned src_screen_number = 0;
-	unsigned dst_screen_number = 0;
+	char *src_screen_name = NULL,
+	     *dst_screen_name = NULL;
 	bool wiggle = true;
 
 	int opt;
@@ -402,10 +493,10 @@ int main( int argc, char *argv[] )
 			dst_name = optarg;
 			break;
 		case 'x':
-			src_screen_number = atoi( optarg );
+			src_screen_name = optarg;
 			break;
 		case 'D':
-			dst_screen_number = atoi( optarg );
+			dst_screen_name = optarg;
 			break;
 		case 'w':
 			wiggle = false;
@@ -419,13 +510,10 @@ int main( int argc, char *argv[] )
 	display src( src_name ), dst( dst_name );
 
 	auto src_screens = src.xinerama_screens();
-	if ( src_screen_number < 0 || src_screen_number >= src_screens.size() )
-		ERR;
 	auto dst_screens = dst.xinerama_screens();
-	if ( dst_screen_number < 0 || dst_screen_number >= dst_screens.size() )
-		ERR;
-	auto &src_screen = src_screens[ src_screen_number ];
-	auto &dst_screen = dst_screens[ dst_screen_number ];
+
+	auto &src_screen = get_xinerama_screen(src, src_screens, src_screen_name);
+	auto &dst_screen = get_xinerama_screen(dst, dst_screens, dst_screen_name);
 
 	// Clone src not to fight with the blocking loop.
 	mouse_replayer mouse( src.clone(), dst, src_screen, dst_screen, wiggle );
