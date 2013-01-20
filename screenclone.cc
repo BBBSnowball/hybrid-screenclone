@@ -25,6 +25,12 @@
 #include <X11/extensions/record.h>
 #include <X11/extensions/Xrandr.h>
 
+//#define ENABLE_NVCTRL
+
+#ifdef ENABLE_NVCTRL
+#	include <NVCtrl/NVCtrlLib.h>
+#endif	// ENABLE_NVCTRL
+
 #define STR2(x) #x
 #define STR(x) STR2( x )
 #define ERR throw std::runtime_error( std::string() + __FILE__ + ":" + STR( __LINE__ ) + " " + __FUNCTION__ )
@@ -385,21 +391,254 @@ void usage( const char *name )
 	exit( 0 );
 }
 
+#ifdef ENABLE_NVCTRL
+
+void split_at_comma(char* str, std::vector<std::string>& parts) {
+	char* comma;
+	do {
+		// skip spaces
+		while (*str == ' ' || *str == '\n')
+			++str;
+
+		// find next comma
+		comma = strchr(str, ',');
+
+		// last characters is either before the comma or last in string
+		char* last = (comma ? comma-1 : str+strlen(str)-1);
+
+		// skip whitespace at end of current part
+		while (last >= str && (*last == ' ' || *last == '\n'))
+			--last;
+
+		// add it, unless it's empty
+		if (last >= str) {
+			// terminate it
+			last++;
+			*last = 0;
+
+			// and then add it
+			parts.push_back(std::string(str));
+		}
+
+		// next time, we start after the comma
+		str = comma+1;
+	} while (comma);	// do that until we cannot find any comma
+}
+
+int parse_display(const char* name) {
+	// see http://disper.sourcearchive.com/documentation/0.3.0-1/nvctrl_8py_source.html
+	int base;
+	const char* num;
+	if ( memcmp(name, "DFP-", 4) == 0 ) {
+		base = 16;
+		num = name + 4;
+	} else if ( memcmp(name, "TV-", 3) == 0 ) {
+		base = 8;
+		num = name + 3;
+	} else if ( memcmp(name, "CRT-", 4) == 0 ) {
+		base = 0;
+		num = name + 4;
+	} else {
+		return -1;
+	}
+
+	return base + atoi(num);
+}
+
+void get_enabled_displays_in_xinerama_order(
+		std::vector<std::string>& enabled_displays_in_xinerama_order,
+		std::vector<int>& enabled_display_nums_in_xinerama_order,
+		int enabled_displays, char* xinerama_order) {
+	// split order string at commas
+	std::vector<std::string> parts;
+	split_at_comma(xinerama_order, parts);
+
+	// add default order
+	parts.push_back("CRT");
+	parts.push_back("DFP");
+	parts.push_back("TV");
+
+	int done_displays = 0;
+
+	for (auto part = parts.begin(); part != parts.end(); ++part) {
+		int display_num = parse_display(part->c_str());
+		if (display_num >= 0) {
+			if ( (done_displays & (1<<display_num)) == 0 ) {
+				done_displays |= (1<<display_num);
+				if ( (enabled_displays & (1<<display_num)) != 0 ) {
+					enabled_displays_in_xinerama_order.push_back(*part);
+					enabled_display_nums_in_xinerama_order.push_back(display_num);
+				}
+			}
+		} else {
+			int base;
+			if (*part == "DFP")
+				base = 16;
+			else if (*part == "TV")
+				base = 8;
+			else if (*part == "CRT")
+				base = 0;
+			else
+				base = -1;
+
+			if (base < 0) {
+				std::cerr << "WARN: ignoring item in TwinViewXineramaInfoOrder: " << *part << std::endl;
+			} else {
+				for (int i=0;i<8;i++) {
+					display_num = base + i;
+					if ( (done_displays & (1<<display_num)) == 0 ) {
+						done_displays |= (1<<display_num);
+						if ( (enabled_displays & (1<<display_num)) != 0 ) {
+							char buffer[20];
+							sprintf(buffer, "%s-%d", part->c_str(), i);
+							enabled_displays_in_xinerama_order.push_back(std::string(buffer));
+							enabled_display_nums_in_xinerama_order.push_back(display_num);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+xinerama_screen& get_xinerama_screen_nvidia(display& disp, int screen, display::screens_vector& screens, char* name)
+{
+	int display_num = parse_display(name);
+
+	if (display_num < 0) {
+		int connected_displays;
+		if (! XNVCTRLQueryAttribute(disp.dpy, screen, 0, NV_CTRL_CONNECTED_DISPLAYS, &connected_displays)) {
+			ERR2("couldn't determine connected displays");
+		}
+
+		for (int display=0;display < 32;display++) {
+			char* display_name;
+
+			if ((connected_displays & (1<<display)) == 0)
+				continue;
+
+			if (XNVCTRLQueryStringAttribute(disp.dpy, screen, (1<<display), NV_CTRL_STRING_DISPLAY_DEVICE_NAME, &display_name)) {
+				bool right_name = strcmp(display_name, name) == 0;
+
+				XFree(display_name);
+
+				if (right_name) {
+					display_num = display;
+					break;
+				}
+			}
+		}
+
+		if (display_num < 0) {
+			std::cerr << "invalid screen name" << std::endl;
+			std::cerr << "valid names (for NVidia): DFP-n, TV-n and CRT-n (with 0 <= n < 8) or monitor name:" << std::endl;
+			for (int display=0;display < 32;display++) {
+				char* display_name;
+
+				if ((connected_displays & (1<<display)) == 0)
+					continue;
+
+				if (XNVCTRLQueryStringAttribute(disp.dpy, screen, (1<<display), NV_CTRL_STRING_DISPLAY_DEVICE_NAME, &display_name)) {
+					std::cerr << " - " << display_name << std::endl;
+
+					XFree(display_name);
+				}
+			}
+
+			ERR2("invalid screen name (NVidia only has DFP-n, TV-n and CRT-n or a monitor name)");
+		}
+	}
+
+	// is it enabled?
+	// (Only enabled displays get a Xinerama screen.)
+	int enabled_displays;
+	if (! XNVCTRLQueryAttribute(disp.dpy, screen, 0, NV_CTRL_ENABLED_DISPLAYS, &enabled_displays)) {
+		ERR2("couldn't determine enabled displays");
+	}
+
+	if ( (enabled_displays & (1<<display_num)) == 0 )
+		ERR2("display not enabled");
+
+	// We assume that TwinView is enabled.
+	int twinview_enabled;
+	if ( !XNVCTRLQueryAttribute(disp.dpy, screen, 0, NV_CTRL_TWINVIEW, &twinview_enabled) )
+		ERR2("cannot get twinview status");
+	if ( ! twinview_enabled )
+		ERR2("TwinView must be enabled");
+
+	char* xinerama_order;
+	if ( ! XNVCTRLQueryStringAttribute(disp.dpy, screen, 0,
+			NV_CTRL_STRING_TWINVIEW_XINERAMA_INFO_ORDER, &xinerama_order))
+		ERR2("couldn't read attribute TWINVIEW_XINERAMA_INFO_ORDER");
+
+	// xinerama_order is the value of the TwinViewXineramaInfoOrder X setting
+	// ftp://download.nvidia.com/XFree86/Linux-x86_64/1.0-9626/README/appendix-d.html
+	std::vector<std::string> enabled_displays_in_xinerama_order;
+	std::vector<int> enabled_display_nums_in_xinerama_order;
+	get_enabled_displays_in_xinerama_order(enabled_displays_in_xinerama_order,
+			enabled_display_nums_in_xinerama_order, enabled_displays, xinerama_order);
+
+	XFree(xinerama_order);
+
+	int xinerama_num = 0;
+	for (auto display_num2 = enabled_display_nums_in_xinerama_order.begin(); display_num2 != enabled_display_nums_in_xinerama_order.end(); ++display_num2) {
+		if (*display_num2 == display_num)
+			return screens[xinerama_num];
+
+		xinerama_num++;
+	}
+
+	printf("display_num: %d\n", display_num);
+
+	std::cout << "enabled devices in xinerama order:" << std::endl;
+	auto num = enabled_display_nums_in_xinerama_order.begin();
+	for (auto display_name = enabled_displays_in_xinerama_order.begin();
+			display_name != enabled_displays_in_xinerama_order.end();
+			++display_name, ++num) {
+		std::cout << "- " << *display_name << " (" << *num << ")" << std::endl;
+	}
+
+	ERR2("display not found in Xinerama order -> probably not enabled");
+}
+
+#endif
+
 xinerama_screen& get_xinerama_screen(display& disp, display::screens_vector& screens, char* name)
 {
-	//auto screens = disp.xinerama_screens();
-
 	if ( !name )
 		return screens[0];
 
 	else if ( name[0] >= '0' && name[0] <= '9' ) {
 		unsigned number = atoi( name );
 
+		printf("screens: %d\n", screens.size());
+
 		if ( number < 0 || number >= screens.size() )
-			ERR;
+			ERR2("invalid screen number");
 
 		return screens[number];
 	}
+
+#	ifdef ENABLE_NVCTRL
+
+	bool use_nvidia = true;
+
+	int event_basep, error_basep;
+	if (! XNVCTRLQueryExtension (disp.dpy, &event_basep, &error_basep) ) {
+		use_nvidia = false;
+	}
+
+	int nv_screen = DefaultScreen (disp.dpy);
+
+	if ( use_nvidia && ! XNVCTRLIsNvScreen(disp.dpy, nv_screen)) {
+		use_nvidia = false;
+	}
+
+	if (use_nvidia) {
+		return get_xinerama_screen_nvidia(disp, nv_screen, screens, name);
+	}
+
+#endif	// ENABLE_NVCTRL
 
 	// It seems to be a name
 	// -> look at Xrandr info and find the name
@@ -438,8 +677,8 @@ xinerama_screen& get_xinerama_screen(display& disp, display::screens_vector& scr
 		if (output_info->crtc != 0) {
 			XRRCrtcInfo* crtc_info = XRRGetCrtcInfo(disp.dpy, res, output_info->crtc);
 
-			printf("  x = %d, y = %d, width = %d, height = %d\n",
-				crtc_info->x, crtc_info->y, crtc_info->width, crtc_info->height);
+			//printf("  x = %d, y = %d, width = %d, height = %d\n",
+			//	crtc_info->x, crtc_info->y, crtc_info->width, crtc_info->height);
 
 			// find a matching Xinerama screen
 			for (unsigned i = 0;i<screens.size();i++) {
